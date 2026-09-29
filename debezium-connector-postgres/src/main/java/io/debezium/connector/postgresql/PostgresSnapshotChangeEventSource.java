@@ -5,7 +5,9 @@
  */
 package io.debezium.connector.postgresql;
 
+import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.Savepoint;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -127,6 +129,32 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
         // SET TRANSACTION SNAPSHOT must be the first statement of a fresh transaction.
         connection.rollback();
         connection.executeWithoutCommitting(snapshotTransactionIsolationLevelStatement(slotCreatedInfo, snapshotContext.onDemand));
+    }
+
+    @Override
+    protected <T> T executeChunkPlanning(RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext,
+                                         ChunkPlanning<T> planning)
+            throws SQLException {
+        // A failed statement aborts the whole PostgreSQL transaction, and with it the snapshot that the data is read
+        // from, so confine a failure of the planning queries to a savepoint.
+        final Connection connection = jdbcConnection.connection();
+        final Savepoint savepoint = connection.setSavepoint();
+        final T result;
+        try {
+            result = planning.plan();
+        }
+        catch (SQLException e) {
+            try {
+                connection.rollback(savepoint);
+            }
+            catch (SQLException rollbackException) {
+                // The connection itself failed (e.g. a socket timeout closed it); restoring it is left to the caller
+                e.addSuppressed(rollbackException);
+            }
+            throw e;
+        }
+        connection.releaseSavepoint(savepoint);
+        return result;
     }
 
     @Override
