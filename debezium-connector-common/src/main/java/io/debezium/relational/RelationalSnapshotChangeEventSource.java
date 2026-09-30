@@ -720,7 +720,15 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
         if (!jdbcConnection.isValid()) {
             LOGGER.warn("Snapshot main connection is no longer valid after a chunk planning failure, attempting reconnect. "
                     + "Snapshot consistency for subsequent tables may be affected.");
-            createSnapshotConnection();
+            // Close rather than reconnect(): close() also drops the prepared statements cached for the lost connection,
+            // and connection() then runs the initial and on-connect statements on the new one, which reconnect() skips.
+            try {
+                jdbcConnection.close();
+            }
+            catch (SQLException e) {
+                LOGGER.debug("Error while closing the lost snapshot main connection", e);
+            }
+            jdbcConnection.connection().setAutoCommit(false);
             connectionCreated(snapshotContext);
             // The main connection is also a member of the connection pool, so apply the pooled connection pin
             // (e.g. Oracle PDB, PostgreSQL exported snapshot) as well.

@@ -12,6 +12,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -132,11 +133,30 @@ public class PostgresSnapshotChangeEventSource extends RelationalSnapshotChangeE
     }
 
     @Override
+    protected OptionalLong rowCountEstimateForTableChunked(TableId tableId) {
+        // readRowCountEstimate() swallows a failure, which would leave the snapshot transaction aborted, so read the
+        // estimate under a savepoint as well.
+        try {
+            return underSavepoint(() -> jdbcConnection.queryRowCountEstimate(tableId));
+        }
+        catch (SQLException e) {
+            LOGGER.warn("Unable to read row count estimate for table '{}' from pg_class; chunk planning will fall back to an exact count", tableId, e);
+            return OptionalLong.empty();
+        }
+    }
+
+    @Override
     protected <T> T executeChunkPlanning(RelationalSnapshotContext<PostgresPartition, PostgresOffsetContext> snapshotContext,
                                          ChunkPlanning<T> planning)
             throws SQLException {
-        // A failed statement aborts the whole PostgreSQL transaction, and with it the snapshot that the data is read
-        // from, so confine a failure of the planning queries to a savepoint.
+        return underSavepoint(planning);
+    }
+
+    /**
+     * A failed statement aborts the whole PostgreSQL transaction, and with it the snapshot that the data is read
+     * from, so confine a failure of the chunk planning queries to a savepoint.
+     */
+    private <T> T underSavepoint(ChunkPlanning<T> planning) throws SQLException {
         final Connection connection = jdbcConnection.connection();
         final Savepoint savepoint = connection.setSavepoint();
         final T result;

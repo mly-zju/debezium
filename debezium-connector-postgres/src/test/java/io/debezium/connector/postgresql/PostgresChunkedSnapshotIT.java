@@ -195,6 +195,7 @@ public class PostgresChunkedSnapshotIT extends AbstractChunkedSnapshotTest<Postg
                 .with(RelationalDatabaseConnectorConfig.TABLE_INCLUDE_LIST, "public.dbz2730a,public.dbz2730b")
                 .with(CommonConnectorConfig.MAX_BATCH_SIZE, 2 * ROW_COUNT)
                 .with(CommonConnectorConfig.MAX_QUEUE_SIZE, 2 * ROW_COUNT + 1)
+                .with(PostgresConnectorConfig.ON_CONNECT_STATEMENTS, "SET application_name = 'dbz2730'")
                 .build();
 
         try (PostgresConnection locker = TestHelper.create()) {
@@ -206,9 +207,15 @@ public class PostgresChunkedSnapshotIT extends AbstractChunkedSnapshotTest<Postg
 
             // Kill the main connection while its row count of dbz2730a waits for the lock, as a socket timeout would
             Awaitility.await().atMost(TestHelper.waitTimeForRecords() * 5L, TimeUnit.SECONDS)
-                    .until(() -> terminateBackendsWaitingOnLock("COUNT(1)"));
+                    .until(() -> countBackendsWaitingOnLock("COUNT(1)") > 0);
+            final long initializedBackends = countInitializedBackends();
+            assertThat(terminateBackendsWaitingOnLock("COUNT(1)")).isTrue();
             Awaitility.await().atMost(TestHelper.waitTimeForRecords() * 5L, TimeUnit.SECONDS)
                     .until(() -> logInterceptor.containsWarnMessage("Snapshot main connection is no longer valid after a chunk planning failure"));
+
+            // The replacement main connection ran the on-connect statements again, like the connection it replaced
+            Awaitility.await().atMost(TestHelper.waitTimeForRecords() * 5L, TimeUnit.SECONDS)
+                    .until(() -> countInitializedBackends() == initializedBackends);
             locker.rollback();
         }
 
@@ -221,6 +228,22 @@ public class PostgresChunkedSnapshotIT extends AbstractChunkedSnapshotTest<Postg
         assertThat(logInterceptor.containsWarnMessage("Table 'public.dbz2730a' chunk planning failed, using single chunk")).isTrue();
         assertTableSnapshotChunked("public.dbz2730b", 1, 2);
         assertChunkedSnapshotFinished(2, 3);
+    }
+
+    private long countBackendsWaitingOnLock(String queryFragment) throws SQLException {
+        try (PostgresConnection admin = TestHelper.create()) {
+            return admin.queryAndMap(
+                    "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%"
+                            + queryFragment + "%' AND pid <> pg_backend_pid()",
+                    rs -> rs.next() ? rs.getLong(1) : 0L);
+        }
+    }
+
+    private long countInitializedBackends() throws SQLException {
+        try (PostgresConnection admin = TestHelper.create()) {
+            return admin.queryAndMap("SELECT count(*) FROM pg_stat_activity WHERE application_name = 'dbz2730'",
+                    rs -> rs.next() ? rs.getLong(1) : 0L);
+        }
     }
 
     private boolean terminateBackendsWaitingOnLock(String queryFragment) throws SQLException {
