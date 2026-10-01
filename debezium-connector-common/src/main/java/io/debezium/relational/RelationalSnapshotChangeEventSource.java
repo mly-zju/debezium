@@ -229,7 +229,9 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
                         }
                     }
                 }
-                rollbackTransaction(connection);
+                // The main connection is reconnected if it fails during chunk planning or a chunk read, which leaves
+                // the connection obtained at the start closed, so roll back the transaction it currently holds.
+                rollbackTransaction(connection != null && jdbcConnection.isConnected() ? jdbcConnection.connection() : connection);
             }
             catch (final Exception e) {
                 LOGGER.error("Error in finally block", e);
@@ -591,9 +593,11 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
 
         final int snapshotMaxThreads = connectionPool.size();
 
+        // Only the estimate is read up front: an exact count is a full scan, and it is only needed for the tables
+        // that are actually chunked and have no estimate, so it is left to the per-table planning below.
         final PreparedTables prepared = prepareTables(snapshotContext,
                 tableId -> determineSnapshotSelect(snapshotContext, tableId, snapshotSelectOverridesByTable),
-                tableId -> OptionalLong.of(rowCountForTableChunked(tableId)));
+                this::rowCountEstimateForTableChunked);
 
         // Create progress tracking and chunks
         final Map<TableId, TableChunkProgress> progressMap = new ConcurrentHashMap<>();
@@ -627,15 +631,19 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
                 tableChunks = List.of(new SnapshotChunk(tableId, table, null, null, 0, 1, tableOrder, tableCount, snapshotSelect.statement(), rowCount));
             }
             else {
-                // Calculate chunk count and boundaries
-                final int multiplier = connectorConfig.getSnapshotMaxThreadsTableMultiplierAsInteger(tableId);
-                final int numChunks = calculateChunkCount(rowCount, snapshotMaxThreads, multiplier);
-                LOGGER.info("Table '{}' calculating chunk boundaries using multiplier {} with {} chunks.", tableId, multiplier, numChunks);
-                final List<Object[]> boundaries = boundaryCalculator.calculateBoundaries(table, keyColumns, rowCount, numChunks);
-                final Object[] maximumKey = boundaryCalculator.calculateMaxKey(table, keyColumns);
-
-                tableChunks = boundaryCalculator.createChunks(table, boundaries, tableOrder, tableCount, snapshotSelect.statement(), rowCount, maximumKey);
-                LOGGER.info("Table '{}' will be processed in {} chunks.", tableId, tableChunks.size());
+                final int order = tableOrder;
+                List<SnapshotChunk> plannedChunks;
+                try {
+                    plannedChunks = executeChunkPlanning(snapshotContext,
+                            () -> planTableChunks(table, keyColumns, snapshotSelect, rowCount, snapshotMaxThreads, boundaryCalculator, order, tableCount));
+                }
+                catch (SQLException e) {
+                    // Chunking is an optimization, so a table whose planning fails is still snapshotted, in one chunk.
+                    LOGGER.warn("Table '{}' chunk planning failed, using single chunk: {}", tableId, e.getMessage(), e);
+                    restoreConnectionAfterChunkPlanningFailure(snapshotContext);
+                    plannedChunks = List.of(new SnapshotChunk(tableId, table, null, null, 0, 1, tableOrder, tableCount, snapshotSelect.statement(), rowCount));
+                }
+                tableChunks = plannedChunks;
             }
 
             progressMap.put(tableId, new TableChunkProgress(tableId, tableChunks.size()));
@@ -660,6 +668,93 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
 
         LOGGER.info("Finished chunk snapshot of {} tables ({} chunks); duration '{}'",
                 tableCount, allChunks.size(), Strings.duration(exportTimer.durations().statistics().getTotal().toMillis()));
+    }
+
+    @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
+    private List<SnapshotChunk> planTableChunks(Table table, List<Column> keyColumns, SnapshotSelect snapshotSelect, OptionalLong rowCountEstimate,
+                                                int snapshotMaxThreads, ChunkBoundaryCalculator boundaryCalculator, int tableOrder, int tableCount)
+            throws SQLException {
+        final TableId tableId = table.id();
+
+        // The row count only caps the number of chunks and sets the stride of the boundary probes; the boundaries
+        // and the maximum key are real key values, so an estimate yields uneven chunks at worst, never lost rows.
+        final OptionalLong rowCount;
+        if (rowCountEstimate.isPresent() && rowCountEstimate.getAsLong() > 0) {
+            rowCount = rowCountEstimate;
+            LOGGER.debug("Table '{}' using estimated row count {} for chunk planning.", tableId, rowCount.getAsLong());
+        }
+        else {
+            rowCount = OptionalLong.of(rowCountForTableChunked(tableId));
+        }
+
+        // Calculate chunk count and boundaries
+        final int multiplier = connectorConfig.getSnapshotMaxThreadsTableMultiplierAsInteger(tableId);
+        final int numChunks = calculateChunkCount(rowCount, snapshotMaxThreads, multiplier);
+        LOGGER.info("Table '{}' calculating chunk boundaries using multiplier {} with {} chunks.", tableId, multiplier, numChunks);
+        final List<Object[]> boundaries = boundaryCalculator.calculateBoundaries(table, keyColumns, rowCount, numChunks);
+        final Object[] maximumKey = boundaryCalculator.calculateMaxKey(table, keyColumns);
+
+        final List<SnapshotChunk> tableChunks = boundaryCalculator.createChunks(table, boundaries, tableOrder, tableCount, snapshotSelect.statement(),
+                rowCount, maximumKey);
+        LOGGER.info("Table '{}' will be processed in {} chunks.", tableId, tableChunks.size());
+        return tableChunks;
+    }
+
+    /**
+     * Runs the chunk planning of one table (the row count, when there is no estimate, and the boundary and maximum
+     * key queries) on the main connection. If it throws, the table is snapshotted as a single chunk.
+     * <p>
+     * Connectors whose transaction becomes unusable after a failed statement should override this to confine the
+     * failure, for example with a savepoint, so that the snapshot transaction survives it.
+     */
+    protected <T> T executeChunkPlanning(RelationalSnapshotContext<P, O> snapshotContext, ChunkPlanning<T> planning) throws SQLException {
+        return planning.plan();
+    }
+
+    /**
+     * Makes the main connection usable again after the chunk planning of a table failed, so that the remaining
+     * tables can be planned and read. By default, a connection that is no longer valid, for example because a
+     * socket timeout closed it, is reconnected and initialized again as the main connection.
+     */
+    protected void restoreConnectionAfterChunkPlanningFailure(RelationalSnapshotContext<P, O> snapshotContext) throws Exception {
+        if (!jdbcConnection.isValid()) {
+            LOGGER.warn("Snapshot main connection is no longer valid after a chunk planning failure, attempting reconnect. "
+                    + "Snapshot consistency for subsequent tables may be affected.");
+            // Close rather than reconnect(): close() also drops the prepared statements cached for the lost connection,
+            // and connection() then runs the initial and on-connect statements on the new one, which reconnect() skips.
+            try {
+                jdbcConnection.close();
+            }
+            catch (SQLException e) {
+                LOGGER.debug("Error while closing the lost snapshot main connection", e);
+            }
+            jdbcConnection.connection().setAutoCommit(false);
+            connectionCreated(snapshotContext);
+            // The main connection is also a member of the connection pool, so apply the pooled connection pin
+            // (e.g. Oracle PDB, PostgreSQL exported snapshot) as well.
+            connectionPoolConnectionCreated(snapshotContext, jdbcConnection);
+        }
+    }
+
+    private void reconnectPooledConnection(RelationalSnapshotContext<P, O> snapshotContext, JdbcConnection connection) throws SQLException {
+        connection.reconnect();
+        initializePooledConnection(connection);
+        // Re-apply the connector-specific pin (e.g. Oracle PDB, PostgreSQL exported snapshot) that
+        // createConnectionPool applies at pool creation, so a reconnected connection is not left with
+        // only the isolation level copied by initializePooledConnection.
+        connectionPoolConnectionCreated(snapshotContext, connection);
+    }
+
+    /**
+     * Returns the row count used to plan the chunks of a table when a statistics-based estimate is available,
+     * which avoids the full scan of {@link #rowCountForTableChunked(TableId)}. Tables that are never chunked (keyless
+     * tables and tables with a select override) only ever use this estimate.
+     *
+     * @param tableId the table to estimate
+     * @return the estimated row count, or {@link OptionalLong#empty()} to fall back to the exact count
+     */
+    protected OptionalLong rowCountEstimateForTableChunked(TableId tableId) {
+        return jdbcConnection.readRowCountEstimate(tableId);
     }
 
     /**
@@ -1352,6 +1447,16 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
     }
 
     /**
+     * The chunk planning of one table, see {@link #executeChunkPlanning(RelationalSnapshotContext, ChunkPlanning)}.
+     *
+     * @param <T> the planning result type
+     */
+    @FunctionalInterface
+    protected interface ChunkPlanning<T> {
+        T plan() throws SQLException;
+    }
+
+    /**
      * Holds the prepared table information for snapshot processing.
      */
     private record PreparedTables(Map<TableId, SnapshotSelect> queryTables, Map<TableId, OptionalLong> rowCountTables) {
@@ -1427,12 +1532,7 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
             final O offset = offsetPool.poll();
             if (!connection.isValid()) {
                 LOGGER.warn("Snapshot pool connection is no longer valid, attempting reconnect. Snapshot consistency for subsequent tables may be affected.");
-                connection.reconnect();
-                initializePooledConnection(connection);
-                // Re-apply the connector-specific pin (e.g. Oracle PDB, PostgreSQL exported snapshot) that
-                // createConnectionPool applies at pool creation, so a reconnected connection is not left with
-                // only the isolation level copied by initializePooledConnection.
-                connectionPoolConnectionCreated(snapshotContext, connection);
+                reconnectPooledConnection(snapshotContext, connection);
             }
             try {
                 work.execute(connection, offset);

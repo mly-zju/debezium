@@ -914,27 +914,35 @@ public class PostgresConnection extends JdbcConnection {
 
     @Override
     public OptionalLong readRowCountEstimate(TableId tableId) {
-        // pg_class.reltuples is a planner estimate maintained by ANALYZE/autovacuum; -1 means "unknown" (never analyzed).
-        final String query = "SELECT c.reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-                + "WHERE n.nspname = ? AND c.relname = ?";
         try {
-            return prepareQueryAndMap(query,
-                    statement -> {
-                        statement.setString(1, tableId.schema());
-                        statement.setString(2, tableId.table());
-                    },
-                    rs -> {
-                        if (rs.next()) {
-                            final long estimate = rs.getLong(1);
-                            return estimate >= 0 ? OptionalLong.of(estimate) : OptionalLong.empty();
-                        }
-                        return OptionalLong.empty();
-                    });
+            return queryRowCountEstimate(tableId);
         }
         catch (SQLException e) {
             LOGGER.warn("Unable to read row count estimate for table '{}' from pg_class; incremental snapshot will fall back to an exact count", tableId, e);
             return OptionalLong.empty();
         }
+    }
+
+    /**
+     * Reads the row count estimate like {@link #readRowCountEstimate(TableId)}, but lets a failure propagate, so that a
+     * caller in a transaction can recover from it (a failed statement aborts the whole PostgreSQL transaction).
+     */
+    public OptionalLong queryRowCountEstimate(TableId tableId) throws SQLException {
+        // pg_class.reltuples is a planner estimate maintained by ANALYZE/autovacuum; -1 means "unknown" (never analyzed).
+        final String query = "SELECT c.reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                + "WHERE n.nspname = ? AND c.relname = ?";
+        return prepareQueryAndMap(query,
+                statement -> {
+                    statement.setString(1, tableId.schema());
+                    statement.setString(2, tableId.table());
+                },
+                rs -> {
+                    if (rs.next()) {
+                        final long estimate = rs.getLong(1);
+                        return estimate >= 0 ? OptionalLong.of(estimate) : OptionalLong.empty();
+                    }
+                    return OptionalLong.empty();
+                });
     }
 
     @Override
